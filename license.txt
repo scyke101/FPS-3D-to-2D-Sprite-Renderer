@@ -1,0 +1,9 @@
+Copyright (c) 2026 Chris Hagerty-Hoff
+
+Permission is granted to use, modify, and distribute this software for
+personal, educational, and non-commercial purposes. 
+
+Commercial use, resale, sublicensing, or inclusion in a paid product or
+service is prohibited without prior written permission.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND.
