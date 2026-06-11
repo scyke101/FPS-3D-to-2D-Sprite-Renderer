@@ -1,10 +1,10 @@
 bl_info = {
     "name": "FP Layer Exporter",
     "author": "Vi",
-    "version": (1, 5, 1),
+    "version": (1, 6, 0),
     "blender": (4, 4, 6),
     "location": "View3D > Sidebar > FP Export",
-    "description": "Exports layered first-person sprite sequences from panel-assigned object categories and dynamically splits weapon top/bottom using a depth-tested weapon visibility pass and Blender compositor nodes",
+    "description": "Exports layered first-person sprite sequences from panel-assigned object categories and dynamically splits weapon top/bottom using a depth-tested weapon visibility pass and Blender compositor nodes, with optional matching normal-map exports",
     "category": "Render",
 }
 
@@ -138,6 +138,12 @@ class FPLayerExportSettings(bpy.types.PropertyGroup):
     transparent_background: bpy.props.BoolProperty(
         name="Transparent Background",
         default=True
+    )
+
+    render_normal_maps: bpy.props.BoolProperty(
+        name="Render Normal Maps",
+        description="Also render matching camera-space normal-map layers into Normal subfolders using a temporary material override",
+        default=False
     )
 
     keep_temp_sources: bpy.props.BoolProperty(
@@ -296,6 +302,118 @@ class FP_OT_clear_category(bpy.types.Operator):
         collection.clear()
         return {"FINISHED"}
 
+
+
+# -----------------------------------------------------------------------------
+# Normal material helpers
+# -----------------------------------------------------------------------------
+
+def get_or_create_normal_output_material():
+    material_name = "M_NormalOutput"
+    old_material = bpy.data.materials.get(material_name)
+
+    if old_material is not None:
+        bpy.data.materials.remove(old_material, do_unlink=True)
+
+    material = bpy.data.materials.new(material_name)
+    material.use_nodes = True
+
+    nodes = material.node_tree.nodes
+    links = material.node_tree.links
+    nodes.clear()
+
+    geometry_node = nodes.new(type="ShaderNodeNewGeometry")
+    geometry_node.location = (-1100, 0)
+
+    transform_node = nodes.new(type="ShaderNodeVectorTransform")
+    transform_node.location = (-850, 0)
+    transform_node.vector_type = 'NORMAL'
+    transform_node.convert_from = 'WORLD'
+    transform_node.convert_to = 'CAMERA'
+
+    axis_fix_node = nodes.new(type="ShaderNodeVectorMath")
+    axis_fix_node.operation = 'MULTIPLY'
+    axis_fix_node.inputs[1].default_value = (1.0, -1.0, -1.0)
+    axis_fix_node.location = (-600, 0)
+
+    multiply_node = nodes.new(type="ShaderNodeVectorMath")
+    multiply_node.operation = 'MULTIPLY'
+    multiply_node.inputs[1].default_value = (0.5, 0.5, 0.5)
+    multiply_node.location = (-350, 0)
+
+    add_node = nodes.new(type="ShaderNodeVectorMath")
+    add_node.operation = 'ADD'
+    add_node.inputs[1].default_value = (0.5, 0.5, 0.5)
+    add_node.location = (-100, 0)
+
+    emission_node = nodes.new(type="ShaderNodeEmission")
+    emission_node.location = (150, 0)
+    emission_node.inputs["Strength"].default_value = 1.0
+
+    output_node = nodes.new(type="ShaderNodeOutputMaterial")
+    output_node.location = (400, 0)
+
+    links.new(geometry_node.outputs["True Normal"], transform_node.inputs["Vector"])
+    links.new(transform_node.outputs["Vector"], axis_fix_node.inputs[0])
+    links.new(axis_fix_node.outputs["Vector"], multiply_node.inputs[0])
+    links.new(multiply_node.outputs["Vector"], add_node.inputs[0])
+    links.new(add_node.outputs["Vector"], emission_node.inputs["Color"])
+    links.new(emission_node.outputs["Emission"], output_node.inputs["Surface"])
+
+    return material
+
+
+def capture_material_slots_by_object(objects):
+    captured = {}
+
+    for obj in objects:
+        data = getattr(obj, "data", None)
+        materials = getattr(data, "materials", None)
+        if materials is None:
+            continue
+
+        captured[obj.name] = [slot for slot in materials]
+
+    return captured
+
+
+def apply_material_override_to_objects(objects, material):
+    for obj in objects:
+        data = getattr(obj, "data", None)
+        materials = getattr(data, "materials", None)
+        if materials is None:
+            continue
+
+        slot_count = max(1, len(materials))
+        materials.clear()
+
+        for _ in range(slot_count):
+            materials.append(material)
+
+
+def restore_material_slots_by_object(captured_materials):
+    for obj_name, materials in captured_materials.items():
+        obj = bpy.data.objects.get(obj_name)
+        if not obj:
+            continue
+
+        data = getattr(obj, "data", None)
+        obj_materials = getattr(data, "materials", None)
+        if obj_materials is None:
+            continue
+
+        obj_materials.clear()
+        for material in materials:
+            obj_materials.append(material)
+
+
+def make_normal_folder(folder):
+    return os.path.join("Normals", folder)
+
+
+def make_normal_filename(filename):
+    name, ext = os.path.splitext(filename)
+    return f"{name}_n{ext}"
 
 # -----------------------------------------------------------------------------
 # Object / render helpers
@@ -742,6 +860,11 @@ class FP_OT_export_layers(bpy.types.Operator):
         original_use_file_extension = scene.render.use_file_extension
         original_hide_render = save_original_hide_render(scene)
 
+        original_view_transform = scene.view_settings.view_transform
+        original_look = scene.view_settings.look
+        original_exposure = scene.view_settings.exposure
+        original_gamma = scene.view_settings.gamma
+
         scene.render.film_transparent = settings.transparent_background
         scene.render.image_settings.file_format = "PNG"
         scene.render.image_settings.color_mode = "RGBA"
@@ -755,6 +878,17 @@ class FP_OT_export_layers(bpy.types.Operator):
 
         total_renders = 0
         total_generated = 0
+
+        normal_material = None
+        normal_override_objects = set()
+        captured_normal_materials = None
+
+        if settings.render_normal_maps:
+            normal_material = get_or_create_normal_output_material()
+            normal_override_objects.update(category_objects["WEAPON"])
+            normal_override_objects.update(category_objects["BODY"])
+            normal_override_objects.update(category_objects["ARMOR"])
+            captured_normal_materials = capture_material_slots_by_object(normal_override_objects)
 
         try:
             with tempfile.TemporaryDirectory(prefix="fp_layer_export_") as temp_dir:
@@ -848,40 +982,140 @@ class FP_OT_export_layers(bpy.types.Operator):
 
                         total_generated += int(bool(weapon_bottom_path)) + int(bool(weapon_top_path))
 
-                        if settings.keep_temp_sources:
-                            source_weapon_path = make_output_path(
-                                base_output_path,
-                                "Source_WeaponFull",
-                                weapon_name,
-                                settings.use_name_subfolders
+                    if settings.render_normal_maps:
+                        apply_material_override_to_objects(normal_override_objects, normal_material)
+                        context.view_layer.update()
+
+                        scene.view_settings.view_transform = 'Standard'
+                        scene.view_settings.look = 'None'
+                        scene.view_settings.exposure = 0.0
+                        scene.view_settings.gamma = 1.0
+
+                        if needs_weapon_split:
+                            normal_weapon_source_path = os.path.join(temp_dir, f"WeaponFull_N_{frame_number}.png")
+                            normal_weapon_visible_path = os.path.join(temp_dir, f"WeaponVisible_N_{frame_number}.png")
+
+                            set_visible_render_category(scene, category_objects["WEAPON"])
+                            render_current_scene_to_file(scene, normal_weapon_source_path)
+                            total_renders += 1
+
+                            render_weapon_visible_depth_pass(
+                                scene,
+                                category_objects["WEAPON"],
+                                category_objects["BODY"],
+                                normal_weapon_visible_path
                             )
-                            source_visible_path = make_output_path(
+                            total_renders += 1
+
+                        if settings.export_body:
+                            normal_body_filename = make_normal_filename(f"{animation_name}_{hand_name}_{frame_number}.png")
+                            normal_body_final_path = layer_output_file(
                                 base_output_path,
-                                "Source_WeaponVisible",
-                                weapon_name,
-                                settings.use_name_subfolders
-                            )
-                            source_body_path = make_output_path(
-                                base_output_path,
-                                "Source_Body",
+                                make_normal_folder("Body"),
                                 hand_name,
-                                settings.use_name_subfolders
+                                settings.use_name_subfolders,
+                                normal_body_filename
                             )
 
-                            shutil.copyfile(weapon_source_path, os.path.join(
-                                source_weapon_path,
-                                f"{animation_name}_{weapon_name}_WeaponFull_{frame_number}.png"
-                            ))
-                            shutil.copyfile(weapon_visible_path, os.path.join(
-                                source_visible_path,
-                                f"{animation_name}_{weapon_name}_WeaponVisible_{frame_number}.png"
-                            ))
-                            shutil.copyfile(body_source_path, os.path.join(
-                                source_body_path,
-                                f"{animation_name}_{hand_name}_Body_{frame_number}.png"
-                            ))
+                            set_visible_render_category(scene, category_objects["BODY"])
+                            render_current_scene_to_file(scene, normal_body_final_path)
+                            total_renders += 1
+
+                        if settings.export_armor and category_objects["ARMOR"]:
+                            normal_armor_filename = make_normal_filename(f"{animation_name}_{armor_name}_{frame_number}.png")
+                            normal_armor_final_path = layer_output_file(
+                                base_output_path,
+                                make_normal_folder("Armor"),
+                                armor_name,
+                                settings.use_name_subfolders,
+                                normal_armor_filename
+                            )
+
+                            set_visible_render_category(scene, category_objects["ARMOR"])
+                            render_current_scene_to_file(scene, normal_armor_final_path)
+                            total_renders += 1
+
+                        if needs_weapon_split:
+                            normal_weapon_bottom_path = None
+                            normal_weapon_top_path = None
+
+                            if settings.export_weapon_bottom:
+                                normal_weapon_bottom_path = layer_output_file(
+                                    base_output_path,
+                                    make_normal_folder("WeaponBottom"),
+                                    weapon_name,
+                                    settings.use_name_subfolders,
+                                    make_normal_filename(f"{animation_name}_{weapon_name}_Bottom_{frame_number}.png")
+                                )
+
+                            if settings.export_weapon_top:
+                                normal_weapon_top_path = layer_output_file(
+                                    base_output_path,
+                                    make_normal_folder("WeaponTop"),
+                                    weapon_name,
+                                    settings.use_name_subfolders,
+                                    make_normal_filename(f"{animation_name}_{weapon_name}_Top_{frame_number}.png")
+                                )
+
+                            try:
+                                split_weapon_with_depth_visible_compositor(
+                                    scene,
+                                    normal_weapon_source_path,
+                                    normal_weapon_visible_path,
+                                    normal_weapon_bottom_path,
+                                    normal_weapon_top_path
+                                )
+                            except Exception as err:
+                                self.report({"ERROR"}, f"Normal weapon split failed: {err}")
+                                return {"CANCELLED"}
+
+                            total_generated += int(bool(normal_weapon_bottom_path)) + int(bool(normal_weapon_top_path))
+
+                        restore_material_slots_by_object(captured_normal_materials)
+                        context.view_layer.update()
+
+                        scene.view_settings.view_transform = original_view_transform
+                        scene.view_settings.look = original_look
+                        scene.view_settings.exposure = original_exposure
+                        scene.view_settings.gamma = original_gamma
+
+                    if needs_weapon_split and settings.keep_temp_sources:
+                        source_weapon_path = make_output_path(
+                            base_output_path,
+                            "Source_WeaponFull",
+                            weapon_name,
+                            settings.use_name_subfolders
+                        )
+                        source_visible_path = make_output_path(
+                            base_output_path,
+                            "Source_WeaponVisible",
+                            weapon_name,
+                            settings.use_name_subfolders
+                        )
+                        source_body_path = make_output_path(
+                            base_output_path,
+                            "Source_Body",
+                            hand_name,
+                            settings.use_name_subfolders
+                        )
+
+                        shutil.copyfile(weapon_source_path, os.path.join(
+                            source_weapon_path,
+                            f"{animation_name}_{weapon_name}_WeaponFull_{frame_number}.png"
+                        ))
+                        shutil.copyfile(weapon_visible_path, os.path.join(
+                            source_visible_path,
+                            f"{animation_name}_{weapon_name}_WeaponVisible_{frame_number}.png"
+                        ))
+                        shutil.copyfile(body_source_path, os.path.join(
+                            source_body_path,
+                            f"{animation_name}_{hand_name}_Body_{frame_number}.png"
+                        ))
 
         finally:
+            if captured_normal_materials is not None:
+                restore_material_slots_by_object(captured_normal_materials)
+
             scene.frame_set(original_frame)
             scene.render.filepath = original_filepath
             scene.render.film_transparent = original_film_transparent
@@ -889,6 +1123,12 @@ class FP_OT_export_layers(bpy.types.Operator):
             scene.render.image_settings.color_mode = original_color_mode
             scene.render.use_overwrite = original_use_overwrite
             scene.render.use_file_extension = original_use_file_extension
+
+            scene.view_settings.view_transform = original_view_transform
+            scene.view_settings.look = original_look
+            scene.view_settings.exposure = original_exposure
+            scene.view_settings.gamma = original_gamma
+
             restore_original_hide_render(original_hide_render)
 
         self.report(
@@ -947,6 +1187,7 @@ class FP_PT_layer_export_panel(bpy.types.Panel):
         box.prop(settings, "output_folder")
         box.prop(settings, "use_name_subfolders")
         box.prop(settings, "transparent_background")
+        box.prop(settings, "render_normal_maps")
 
         box.separator()
 
