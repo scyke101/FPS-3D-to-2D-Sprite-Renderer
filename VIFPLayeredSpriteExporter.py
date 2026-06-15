@@ -107,8 +107,8 @@ class FPLayerExportSettings(bpy.types.PropertyGroup):
 
     frame_padding: bpy.props.IntProperty(
         name="Frame Padding",
-        default=2,
-        min=1,
+        default=0,
+        min=0,
         max=6
     )
 
@@ -144,6 +144,12 @@ class FPLayerExportSettings(bpy.types.PropertyGroup):
         name="Render Normal Maps",
         description="Also render matching camera-space normal-map layers into Normal subfolders using a temporary material override",
         default=False
+    )
+
+    normal_maps_use_smooth_normals: bpy.props.BoolProperty(
+        name="Smooth Normal Maps",
+        description="Use smoothed/interpolated normals instead of blocky face normals",
+        default=True
     )
 
     keep_temp_sources: bpy.props.BoolProperty(
@@ -308,7 +314,7 @@ class FP_OT_clear_category(bpy.types.Operator):
 # Normal material helpers
 # -----------------------------------------------------------------------------
 
-def get_or_create_normal_output_material():
+def get_or_create_normal_output_material(use_smooth_normals=True):
     material_name = "M_NormalOutput"
     old_material = bpy.data.materials.get(material_name)
 
@@ -353,7 +359,8 @@ def get_or_create_normal_output_material():
     output_node = nodes.new(type="ShaderNodeOutputMaterial")
     output_node.location = (400, 0)
 
-    links.new(geometry_node.outputs["True Normal"], transform_node.inputs["Vector"])
+    normal_output = "Normal" if use_smooth_normals else "True Normal"
+    links.new(geometry_node.outputs[normal_output], transform_node.inputs["Vector"])
     links.new(transform_node.outputs["Vector"], axis_fix_node.inputs[0])
     links.new(axis_fix_node.outputs["Vector"], multiply_node.inputs[0])
     links.new(multiply_node.outputs["Vector"], add_node.inputs[0])
@@ -884,7 +891,9 @@ class FP_OT_export_layers(bpy.types.Operator):
         captured_normal_materials = None
 
         if settings.render_normal_maps:
-            normal_material = get_or_create_normal_output_material()
+            normal_material = get_or_create_normal_output_material(
+                settings.normal_maps_use_smooth_normals
+            )
             normal_override_objects.update(category_objects["WEAPON"])
             normal_override_objects.update(category_objects["BODY"])
             normal_override_objects.update(category_objects["ARMOR"])
@@ -914,7 +923,7 @@ class FP_OT_export_layers(bpy.types.Operator):
                         total_renders += 1
 
                     if settings.export_body or needs_weapon_split:
-                        body_filename = f"{animation_name}_{hand_name}_{frame_number}.png"
+                        body_filename = f"{hand_name}_{animation_name}_{frame_number}.png"
                         body_final_path = layer_output_file(
                             base_output_path,
                             "Body",
@@ -933,7 +942,7 @@ class FP_OT_export_layers(bpy.types.Operator):
                             body_source_path = body_final_path
 
                     if settings.export_armor and category_objects["ARMOR"]:
-                        armor_filename = f"{animation_name}_{armor_name}_{frame_number}.png"
+                        armor_filename = f"{armor_name}_{animation_name}_{frame_number}.png"
                         armor_final_path = layer_output_file(
                             base_output_path,
                             "Armor",
@@ -956,7 +965,7 @@ class FP_OT_export_layers(bpy.types.Operator):
                                 "WeaponBottom",
                                 weapon_name,
                                 settings.use_name_subfolders,
-                                f"{animation_name}_{weapon_name}_Bottom_{frame_number}.png"
+                                f"{weapon_name}_{animation_name}_Bottom_{frame_number}.png"
                             )
 
                         if settings.export_weapon_top:
@@ -965,7 +974,7 @@ class FP_OT_export_layers(bpy.types.Operator):
                                 "WeaponTop",
                                 weapon_name,
                                 settings.use_name_subfolders,
-                                f"{animation_name}_{weapon_name}_Top_{frame_number}.png"
+                                f"{weapon_name}_{animation_name}_Top_{frame_number}.png"
                             )
 
                         try:
@@ -1008,7 +1017,7 @@ class FP_OT_export_layers(bpy.types.Operator):
                             total_renders += 1
 
                         if settings.export_body:
-                            normal_body_filename = make_normal_filename(f"{animation_name}_{hand_name}_{frame_number}.png")
+                            normal_body_filename = make_normal_filename(f"{hand_name}_{animation_name}_{frame_number}.png")
                             normal_body_final_path = layer_output_file(
                                 base_output_path,
                                 make_normal_folder("Body"),
@@ -1022,7 +1031,7 @@ class FP_OT_export_layers(bpy.types.Operator):
                             total_renders += 1
 
                         if settings.export_armor and category_objects["ARMOR"]:
-                            normal_armor_filename = make_normal_filename(f"{animation_name}_{armor_name}_{frame_number}.png")
+                            normal_armor_filename = make_normal_filename(f"{armor_name}_{animation_name}_{frame_number}.png")
                             normal_armor_final_path = layer_output_file(
                                 base_output_path,
                                 make_normal_folder("Armor"),
@@ -1045,7 +1054,7 @@ class FP_OT_export_layers(bpy.types.Operator):
                                     make_normal_folder("WeaponBottom"),
                                     weapon_name,
                                     settings.use_name_subfolders,
-                                    make_normal_filename(f"{animation_name}_{weapon_name}_Bottom_{frame_number}.png")
+                                    make_normal_filename(f"{weapon_name}_{animation_name}_Bottom_{frame_number}.png")
                                 )
 
                             if settings.export_weapon_top:
@@ -1054,7 +1063,7 @@ class FP_OT_export_layers(bpy.types.Operator):
                                     make_normal_folder("WeaponTop"),
                                     weapon_name,
                                     settings.use_name_subfolders,
-                                    make_normal_filename(f"{animation_name}_{weapon_name}_Top_{frame_number}.png")
+                                    make_normal_filename(f"{weapon_name}_{animation_name}_Top_{frame_number}.png")
                                 )
 
                             try:
@@ -1101,15 +1110,15 @@ class FP_OT_export_layers(bpy.types.Operator):
 
                         shutil.copyfile(weapon_source_path, os.path.join(
                             source_weapon_path,
-                            f"{animation_name}_{weapon_name}_WeaponFull_{frame_number}.png"
+                            f"{weapon_name}_{animation_name}_WeaponFull_{frame_number}.png"
                         ))
                         shutil.copyfile(weapon_visible_path, os.path.join(
                             source_visible_path,
-                            f"{animation_name}_{weapon_name}_WeaponVisible_{frame_number}.png"
+                            f"{weapon_name}_{animation_name}_WeaponVisible_{frame_number}.png"
                         ))
                         shutil.copyfile(body_source_path, os.path.join(
                             source_body_path,
-                            f"{animation_name}_{hand_name}_Body_{frame_number}.png"
+                            f"{hand_name}_{animation_name}_Body_{frame_number}.png"
                         ))
 
         finally:
@@ -1188,6 +1197,9 @@ class FP_PT_layer_export_panel(bpy.types.Panel):
         box.prop(settings, "use_name_subfolders")
         box.prop(settings, "transparent_background")
         box.prop(settings, "render_normal_maps")
+
+        if settings.render_normal_maps:
+            box.prop(settings, "normal_maps_use_smooth_normals")
 
         box.separator()
 
