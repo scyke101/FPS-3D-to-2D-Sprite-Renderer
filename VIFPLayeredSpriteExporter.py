@@ -1,10 +1,10 @@
 bl_info = {
     "name": "FP Layer Exporter",
     "author": "Vi",
-    "version": (1, 6, 0),
+    "version": (1, 7, 1),
     "blender": (4, 4, 6),
     "location": "View3D > Sidebar > FP Export",
-    "description": "Exports layered first-person sprite sequences from panel-assigned object categories and dynamically splits weapon top/bottom using a depth-tested weapon visibility pass and Blender compositor nodes, with optional matching normal-map exports",
+    "description": "Exports layered first-person sprite sequences from panel-assigned object categories, dynamically splits weapon top/bottom, and optionally renders armor depth-clipped by the body using holdout masking with seam expansion, with optional matching normal-map exports",
     "category": "Render",
 }
 
@@ -129,6 +129,26 @@ class FPLayerExportSettings(bpy.types.PropertyGroup):
         default=True
     )
 
+    armor_body_holdout: bpy.props.BoolProperty(
+        name="Body Holdout for Armor",
+        default=True,
+        description="Render armor with Body objects as holdouts so body-hidden interior armor pixels are removed by real 3D depth"
+    )
+
+    expand_armor: bpy.props.BoolProperty(
+        name="Expand Armor",
+        default=True,
+        description="Restore a small overlap from ArmorFull to hide tiny seams where the body holdout over-cuts the armor"
+    )
+
+    armor_expand_pixels: bpy.props.IntProperty(
+        name="Armor Expand Pixels",
+        description="Restore this many pixels from ArmorFull around the depth-tested ArmorVisible edge to prevent seams",
+        default=1,
+        min=0,
+        max=4
+    )
+
     export_weapon_top: bpy.props.BoolProperty(
         name="Export Weapon Top",
         default=True,
@@ -152,10 +172,30 @@ class FPLayerExportSettings(bpy.types.PropertyGroup):
         default=True
     )
 
+    pack_specular_emissive_alpha: bpy.props.BoolProperty(
+        name="Pack Roughness/Emissive Alpha",
+        description="Encode shininess from roughness or emissive strength into the normal-map alpha channel",
+        default=False
+    )
+
     keep_temp_sources: bpy.props.BoolProperty(
         name="Keep Source Renders",
         description="Also save WeaponFull, WeaponVisible, and Body source renders for debugging",
         default=False
+    )
+
+    expand_weapon_top: bpy.props.BoolProperty(
+        name="Expand Weapon Top",
+        description="Restore a small overlap from WeaponFull to hide seams",
+        default=True
+    )
+
+    weapon_top_expand_pixels: bpy.props.IntProperty(
+        name="Weapon Top Expand Pixels",
+        description="Dilate the generated WeaponTop alpha by this many pixels to prevent tiny seams where the body holdout over-cuts the weapon",
+        default=1,
+        min=0,
+        max=4
     )
 
 
@@ -371,47 +411,70 @@ def get_or_create_normal_output_material(use_smooth_normals=True):
 
 
 def capture_material_slots_by_object(objects):
+    """
+    Capture the actual object material slots, including slot link mode.
+
+    This is safer than only storing obj.data.materials because Blender material
+    slots can be OBJECT-linked instead of DATA-linked, and multiple objects can
+    share the same mesh datablock. Restoring through obj.material_slots preserves
+    what the object actually had assigned before temporary render overrides.
+    """
     captured = {}
 
     for obj in objects:
-        data = getattr(obj, "data", None)
-        materials = getattr(data, "materials", None)
-        if materials is None:
+        slots = getattr(obj, "material_slots", None)
+        if slots is None:
             continue
 
-        captured[obj.name] = [slot for slot in materials]
+        captured[obj.name] = [(slot.material, slot.link) for slot in slots]
 
     return captured
 
 
 def apply_material_override_to_objects(objects, material):
     for obj in objects:
-        data = getattr(obj, "data", None)
-        materials = getattr(data, "materials", None)
-        if materials is None:
+        slots = getattr(obj, "material_slots", None)
+        if slots is None:
             continue
 
-        slot_count = max(1, len(materials))
-        materials.clear()
+        data = getattr(obj, "data", None)
+        data_materials = getattr(data, "materials", None)
+        if data_materials is None:
+            continue
 
-        for _ in range(slot_count):
-            materials.append(material)
+        if len(slots) == 0:
+            data_materials.append(material)
+        else:
+            for slot in slots:
+                slot.material = material
 
 
 def restore_material_slots_by_object(captured_materials):
-    for obj_name, materials in captured_materials.items():
+    for obj_name, saved_slots in captured_materials.items():
         obj = bpy.data.objects.get(obj_name)
         if not obj:
             continue
 
         data = getattr(obj, "data", None)
-        obj_materials = getattr(data, "materials", None)
-        if obj_materials is None:
+        data_materials = getattr(data, "materials", None)
+        if data_materials is None:
             continue
 
-        obj_materials.clear()
-        for material in materials:
-            obj_materials.append(material)
+        # Match the original slot count first. Extra temporary slots are removed;
+        # missing slots are recreated as empty slots before restoring assignments.
+        while len(obj.material_slots) > len(saved_slots):
+            data_materials.pop(index=len(obj.material_slots) - 1)
+
+        while len(obj.material_slots) < len(saved_slots):
+            data_materials.append(None)
+
+        for index, (material, link) in enumerate(saved_slots):
+            try:
+                obj.material_slots[index].link = link
+            except Exception:
+                pass
+
+            obj.material_slots[index].material = material
 
 
 def make_normal_folder(folder):
@@ -421,6 +484,233 @@ def make_normal_folder(folder):
 def make_normal_filename(filename):
     name, ext = os.path.splitext(filename)
     return f"{name}_n{ext}"
+
+
+def clamp01(value):
+    return max(0.0, min(1.0, float(value)))
+
+
+def socket_default_float(socket, fallback=0.0):
+    if socket is None:
+        return fallback
+
+    value = getattr(socket, "default_value", fallback)
+
+    if isinstance(value, (int, float)):
+        return float(value)
+
+    return fallback
+
+
+def socket_default_color_strength(socket):
+    if socket is None:
+        return 0.0
+
+    value = getattr(socket, "default_value", None)
+
+    if value is None:
+        return 0.0
+
+    if isinstance(value, (int, float)):
+        return float(value)
+
+    try:
+        return max(float(value[0]), float(value[1]), float(value[2]))
+    except Exception:
+        return 0.0
+
+
+def get_linked_socket_source(socket):
+    if socket is None or not socket.is_linked:
+        return None
+
+    return socket.links[0].from_socket
+
+
+def get_socket_value_or_linked_default(socket, fallback=0.0):
+    source_socket = get_linked_socket_source(socket)
+
+    if source_socket is not None:
+        return socket_default_float(source_socket, fallback)
+
+    return socket_default_float(socket, fallback)
+
+
+def get_socket_color_strength_or_linked_default(socket):
+    source_socket = get_linked_socket_source(socket)
+
+    if source_socket is not None:
+        return socket_default_color_strength(source_socket)
+
+    return socket_default_color_strength(socket)
+
+
+def find_principled_bsdf(material):
+    if material is None or not material.use_nodes or material.node_tree is None:
+        return None
+
+    for node in material.node_tree.nodes:
+        if node.bl_idname == "ShaderNodeBsdfPrincipled":
+            return node
+
+    return None
+
+
+def get_node_input(node, names):
+    if node is None:
+        return None
+
+    for name in names:
+        socket = node.inputs.get(name)
+
+        if socket is not None:
+            return socket
+
+    return None
+
+
+def get_material_roughness_emissive_data(material):
+    if material is None:
+        return 0.5, 0.0
+
+    roughness_value = 0.5
+    emissive_value = 0.0
+    emissive_threshold = 0.01
+
+    principled = find_principled_bsdf(material)
+
+    if principled is not None:
+        roughness_socket = get_node_input(principled, ["Roughness"])
+        emission_strength_socket = get_node_input(principled, ["Emission Strength", "EmissionStrength"])
+        emission_color_socket = get_node_input(principled, ["Emission Color", "Emission"])
+
+        roughness_value = get_socket_value_or_linked_default(
+            roughness_socket,
+            roughness_value
+        )
+
+        emission_strength = get_socket_value_or_linked_default(
+            emission_strength_socket,
+            0.0
+        )
+
+        emission_color_strength = get_socket_color_strength_or_linked_default(
+            emission_color_socket
+        )
+
+        raw_emissive = emission_strength * emission_color_strength
+
+        if raw_emissive > emissive_threshold:
+            emissive_value = raw_emissive
+
+    return clamp01(roughness_value), clamp01(emissive_value)
+
+
+def encode_roughness_emissive_alpha(roughness_value=0.5, emissive_value=0.0):
+    roughness_value = clamp01(roughness_value)
+    emissive_value = clamp01(emissive_value)
+
+    if emissive_value > 0.0:
+        return (128.0 + (emissive_value * 127.0)) / 255.0
+
+    shininess_value = 1.0 - roughness_value
+    return (shininess_value * 127.0) / 255.0
+
+
+def get_or_create_scalar_output_material(material_name, scalar_value):
+    safe_name = material_name if material_name else "None"
+    output_name = f"M_FP_SpriteData_{safe_name}_{int(scalar_value * 255.0):03d}"
+    old_material = bpy.data.materials.get(output_name)
+
+    if old_material is not None:
+        bpy.data.materials.remove(old_material, do_unlink=True)
+
+    material = bpy.data.materials.new(output_name)
+    material.use_nodes = True
+
+    nodes = material.node_tree.nodes
+    links = material.node_tree.links
+    nodes.clear()
+
+    emission_node = nodes.new(type="ShaderNodeEmission")
+    emission_node.location = (0, 0)
+    emission_node.inputs["Color"].default_value = (
+        scalar_value,
+        scalar_value,
+        scalar_value,
+        1.0
+    )
+    emission_node.inputs["Strength"].default_value = 1.0
+
+    output_node = nodes.new(type="ShaderNodeOutputMaterial")
+    output_node.location = (250, 0)
+    links.new(emission_node.outputs["Emission"], output_node.inputs["Surface"])
+
+    return material
+
+
+def apply_sprite_data_materials_to_objects(objects):
+    for obj in objects:
+        data = getattr(obj, "data", None)
+        materials = getattr(data, "materials", None)
+        if materials is None:
+            continue
+
+        original_materials = [slot for slot in materials]
+
+        if not original_materials:
+            roughness_value, emissive_value = get_material_roughness_emissive_data(None)
+            scalar_value = encode_roughness_emissive_alpha(roughness_value, emissive_value)
+            materials.append(get_or_create_scalar_output_material("None", scalar_value))
+            continue
+
+        data_materials = []
+
+        for original_material in original_materials:
+            roughness_value, emissive_value = get_material_roughness_emissive_data(original_material)
+            scalar_value = encode_roughness_emissive_alpha(roughness_value, emissive_value)
+            material_name = original_material.name if original_material else "None"
+            data_materials.append(get_or_create_scalar_output_material(material_name, scalar_value))
+
+        materials.clear()
+        for material in data_materials:
+            materials.append(material)
+
+
+def combine_normal_alpha_with_sprite_data(normal_path, data_path):
+    if not normal_path or not data_path:
+        return
+
+    if not os.path.exists(normal_path) or not os.path.exists(data_path):
+        return
+
+    normal_image = bpy.data.images.load(normal_path, check_existing=False)
+    data_image = bpy.data.images.load(data_path, check_existing=False)
+
+    try:
+        try:
+            data_image.colorspace_settings.name = "Non-Color"
+        except Exception:
+            pass
+
+        normal_pixels = list(normal_image.pixels)
+        data_pixels = list(data_image.pixels)
+        pixel_count = min(len(normal_pixels), len(data_pixels)) // 4
+
+        for index in range(pixel_count):
+            alpha_index = (index * 4) + 3
+            red_index = index * 4
+
+            if normal_pixels[alpha_index] > 0.0:
+                normal_pixels[alpha_index] = data_pixels[red_index]
+
+        normal_image.pixels.foreach_set(normal_pixels)
+        normal_image.save_render(normal_path)
+
+    finally:
+        bpy.data.images.remove(normal_image)
+        bpy.data.images.remove(data_image)
+
 
 # -----------------------------------------------------------------------------
 # Object / render helpers
@@ -484,47 +774,39 @@ def make_temp_holdout_material():
 
 
 def save_object_material_slots(objects):
-    saved = {}
-
-    for obj in objects:
-        data = getattr(obj, "data", None)
-        materials = getattr(data, "materials", None)
-        if materials is None:
-            continue
-
-        saved[obj.name] = [slot for slot in materials]
-
-    return saved
+    return capture_material_slots_by_object(objects)
 
 
 def assign_holdout_material(objects, holdout_material):
-    for obj in objects:
-        data = getattr(obj, "data", None)
-        materials = getattr(data, "materials", None)
-        if materials is None:
-            continue
-
-        if len(materials) == 0:
-            materials.append(holdout_material)
-        else:
-            for index in range(len(materials)):
-                materials[index] = holdout_material
+    apply_material_override_to_objects(objects, holdout_material)
 
 
 def restore_object_material_slots(saved_materials):
-    for obj_name, materials in saved_materials.items():
-        obj = bpy.data.objects.get(obj_name)
-        if not obj:
-            continue
+    restore_material_slots_by_object(saved_materials)
 
-        data = getattr(obj, "data", None)
-        obj_materials = getattr(data, "materials", None)
-        if obj_materials is None:
-            continue
 
-        obj_materials.clear()
-        for material in materials:
-            obj_materials.append(material)
+def render_visible_depth_pass(scene, foreground_objects, holdout_objects, filepath):
+    """
+    Render foreground pixels that survive real 3D depth against holdout objects.
+
+    Foreground objects render normally. Holdout objects render with a Holdout
+    shader, meaning they write alpha/depth occlusion without contributing color.
+    If the foreground is in front of the holdout geometry, it remains visible.
+    If it is behind the holdout geometry, the holdout cuts it out.
+    """
+    visible_objects = set(foreground_objects) | set(holdout_objects)
+    holdout_material = None
+    saved_holdout_materials = save_object_material_slots(holdout_objects)
+
+    try:
+        holdout_material = make_temp_holdout_material()
+        assign_holdout_material(holdout_objects, holdout_material)
+        set_visible_render_category(scene, visible_objects)
+        render_current_scene_to_file(scene, filepath)
+    finally:
+        restore_object_material_slots(saved_holdout_materials)
+        if holdout_material and holdout_material.name in bpy.data.materials:
+            bpy.data.materials.remove(holdout_material)
 
 
 def render_weapon_visible_depth_pass(scene, weapon_objects, body_objects, filepath):
@@ -536,19 +818,17 @@ def render_weapon_visible_depth_pass(scene, weapon_objects, body_objects, filepa
     color. If the weapon is in front of the body, it remains visible. If it is
     behind the body, the body cuts it out.
     """
-    visible_objects = set(weapon_objects) | set(body_objects)
-    holdout_material = None
-    saved_body_materials = save_object_material_slots(body_objects)
+    render_visible_depth_pass(scene, weapon_objects, body_objects, filepath)
 
-    try:
-        holdout_material = make_temp_holdout_material()
-        assign_holdout_material(body_objects, holdout_material)
-        set_visible_render_category(scene, visible_objects)
-        render_current_scene_to_file(scene, filepath)
-    finally:
-        restore_object_material_slots(saved_body_materials)
-        if holdout_material and holdout_material.name in bpy.data.materials:
-            bpy.data.materials.remove(holdout_material)
+
+def render_armor_visible_depth_pass(scene, armor_objects, body_objects, filepath):
+    """
+    Render armor pixels that survive real 3D depth against the body.
+
+    Armor objects render normally. Body objects render with a Holdout shader,
+    so body-hidden interior armor faces are cut out before the PNG is saved.
+    """
+    render_visible_depth_pass(scene, armor_objects, body_objects, filepath)
 
 
 # -----------------------------------------------------------------------------
@@ -708,111 +988,354 @@ def add_file_output_node(nodes, output_dir, slot_prefixes):
     return file_node
 
 
+def save_pixels_to_png(width, height, pixels, filepath):
+    os.makedirs(os.path.dirname(filepath), exist_ok=True)
+
+    image = bpy.data.images.new(
+        name="FP_Layer_Pixel_Output",
+        width=width,
+        height=height,
+        alpha=True,
+        float_buffer=False
+    )
+
+    try:
+        image.pixels.foreach_set(pixels)
+        image.filepath_raw = filepath
+        image.file_format = "PNG"
+        image.save()
+    finally:
+        bpy.data.images.remove(image)
+
+
+def copy_png_file(source_path, destination_path):
+    if not destination_path:
+        return
+
+    os.makedirs(os.path.dirname(destination_path), exist_ok=True)
+
+    if os.path.exists(destination_path):
+        os.remove(destination_path)
+
+    shutil.copyfile(source_path, destination_path)
+
+
+
+def dilate_rgba_alpha_pixels(width, height, source_pixels, expand_pixels):
+    """
+    Expand non-transparent RGBA pixels outward by expand_pixels.
+
+    New pixels copy color from the nearest source pixel. Existing pixels are
+    preserved. This creates a tiny visual overlap for layered sprites and helps
+    hide depth/alpha seams between WeaponTop and Body.
+    """
+    expand_pixels = int(max(0, expand_pixels))
+
+    if expand_pixels <= 0:
+        return list(source_pixels)
+
+    output_pixels = list(source_pixels)
+    pixel_count = width * height
+
+    source_alpha = [0.0] * pixel_count
+    for pixel_index in range(pixel_count):
+        source_alpha[pixel_index] = source_pixels[(pixel_index * 4) + 3]
+
+    for y in range(height):
+        for x in range(width):
+            pixel_index = (y * width) + x
+            base = pixel_index * 4
+
+            if source_alpha[pixel_index] > 0.0:
+                continue
+
+            best_source_index = -1
+            best_distance_sq = None
+            best_alpha = 0.0
+
+            y_min = max(0, y - expand_pixels)
+            y_max = min(height - 1, y + expand_pixels)
+            x_min = max(0, x - expand_pixels)
+            x_max = min(width - 1, x + expand_pixels)
+
+            for sample_y in range(y_min, y_max + 1):
+                for sample_x in range(x_min, x_max + 1):
+                    dx = sample_x - x
+                    dy = sample_y - y
+                    distance_sq = (dx * dx) + (dy * dy)
+
+                    if distance_sq == 0 or distance_sq > (expand_pixels * expand_pixels):
+                        continue
+
+                    sample_index = (sample_y * width) + sample_x
+                    sample_alpha = source_alpha[sample_index]
+
+                    if sample_alpha <= 0.0:
+                        continue
+
+                    if (
+                        best_source_index < 0
+                        or distance_sq < best_distance_sq
+                        or (distance_sq == best_distance_sq and sample_alpha > best_alpha)
+                    ):
+                        best_source_index = sample_index
+                        best_distance_sq = distance_sq
+                        best_alpha = sample_alpha
+
+            if best_source_index < 0:
+                continue
+
+            source_base = best_source_index * 4
+            output_pixels[base + 0] = source_pixels[source_base + 0]
+            output_pixels[base + 1] = source_pixels[source_base + 1]
+            output_pixels[base + 2] = source_pixels[source_base + 2]
+            output_pixels[base + 3] = best_alpha
+
+    return output_pixels
+
+
+def save_expanded_weapon_top(weapon_full_path, weapon_visible_path, destination_path, expand_pixels):
+    """
+    Save WeaponTop from WeaponVisible, but restore a small rim from WeaponFull
+    wherever the depth-tested visible pass appears to have over-cut the weapon.
+
+    This is intentionally different from simple dilation. Simple dilation only
+    grows fully transparent pixels. Many Blender edge pixels are already barely
+    non-transparent due to antialiasing, so a naive dilate can appear to do
+    nothing. This version compares WeaponVisible against WeaponFull and can
+    replace weak/over-cut visible alpha with the real full weapon pixel when it
+    is close to a visible weapon pixel.
+    """
+    if not weapon_visible_path or not destination_path:
+        return
+
+    expand_pixels = int(max(0, expand_pixels))
+
+    if expand_pixels <= 0 or not weapon_full_path:
+        copy_png_file(weapon_visible_path, destination_path)
+        return
+
+    full_image = None
+    visible_image = None
+
+    try:
+        full_image = bpy.data.images.load(weapon_full_path, check_existing=False)
+        visible_image = bpy.data.images.load(weapon_visible_path, check_existing=False)
+
+        full_width, full_height = full_image.size
+        visible_width, visible_height = visible_image.size
+
+        if full_width != visible_width or full_height != visible_height:
+            copy_png_file(weapon_visible_path, destination_path)
+            return
+
+        width = full_width
+        height = full_height
+        pixel_count = width * height
+
+        full_pixels = [0.0] * (pixel_count * 4)
+        visible_pixels = [0.0] * (pixel_count * 4)
+        output_pixels = [0.0] * (pixel_count * 4)
+
+        full_image.pixels.foreach_get(full_pixels)
+        visible_image.pixels.foreach_get(visible_pixels)
+
+        output_pixels[:] = visible_pixels[:]
+
+        visible_alpha = [0.0] * pixel_count
+        full_alpha = [0.0] * pixel_count
+
+        for pixel_index in range(pixel_count):
+            base = pixel_index * 4
+            visible_alpha[pixel_index] = visible_pixels[base + 3]
+            full_alpha[pixel_index] = full_pixels[base + 3]
+
+        radius_sq = expand_pixels * expand_pixels
+        visible_threshold = 0.01
+        improvement_threshold = 0.001
+
+        for y in range(height):
+            for x in range(width):
+                pixel_index = (y * width) + x
+                base = pixel_index * 4
+
+                # Only fill pixels that are actually part of the full weapon and
+                # where the visible/depth pass has less alpha than the full pass.
+                if full_alpha[pixel_index] <= visible_alpha[pixel_index] + improvement_threshold:
+                    continue
+
+                near_visible_weapon = False
+                y_min = max(0, y - expand_pixels)
+                y_max = min(height - 1, y + expand_pixels)
+                x_min = max(0, x - expand_pixels)
+                x_max = min(width - 1, x + expand_pixels)
+
+                for sample_y in range(y_min, y_max + 1):
+                    if near_visible_weapon:
+                        break
+                    for sample_x in range(x_min, x_max + 1):
+                        dx = sample_x - x
+                        dy = sample_y - y
+                        distance_sq = (dx * dx) + (dy * dy)
+
+                        if distance_sq > radius_sq:
+                            continue
+
+                        sample_index = (sample_y * width) + sample_x
+                        if visible_alpha[sample_index] > visible_threshold:
+                            near_visible_weapon = True
+                            break
+
+                if not near_visible_weapon:
+                    continue
+
+                # Restore the actual full-weapon pixel, not a smeared neighbor.
+                # This prevents growing color outside the real weapon silhouette.
+                output_pixels[base + 0] = full_pixels[base + 0]
+                output_pixels[base + 1] = full_pixels[base + 1]
+                output_pixels[base + 2] = full_pixels[base + 2]
+                output_pixels[base + 3] = full_pixels[base + 3]
+
+        save_pixels_to_png(width, height, output_pixels, destination_path)
+
+    finally:
+        if full_image:
+            bpy.data.images.remove(full_image)
+        if visible_image:
+            bpy.data.images.remove(visible_image)
+
+
+
+def save_expanded_holdout_layer(full_path, visible_path, destination_path, expand_pixels):
+    """
+    Save a depth-tested foreground layer, optionally restoring a small rim from
+    the full foreground render. Used by both WeaponTop and Armor.
+    """
+    save_expanded_weapon_top(
+        full_path,
+        visible_path,
+        destination_path,
+        expand_pixels
+    )
+
+
+def render_holdout_layer_with_optional_expansion(
+    scene,
+    foreground_objects,
+    holdout_objects,
+    full_path,
+    visible_path,
+    final_path,
+    expand_pixels
+):
+    """
+    Render a layer as Full + Visible-against-holdout, then save the visible
+    result with an optional restored rim from the full render.
+
+    This mirrors the WeaponTop seam-hiding flow for any foreground layer.
+    """
+    set_visible_render_category(scene, foreground_objects)
+    render_current_scene_to_file(scene, full_path)
+
+    render_visible_depth_pass(
+        scene,
+        foreground_objects,
+        holdout_objects,
+        visible_path
+    )
+
+    save_expanded_holdout_layer(
+        full_path,
+        visible_path,
+        final_path,
+        expand_pixels
+    )
+
 def split_weapon_with_depth_visible_compositor(
     source_scene,
     weapon_full_path,
     weapon_visible_path,
     weapon_bottom_path,
-    weapon_top_path
+    weapon_top_path,
+    weapon_top_expand_pixels=0
 ):
+    """
+    Split WeaponFull into WeaponBottom and WeaponTop using already-rendered PNGs.
+
+    This intentionally does not use Blender compositor nodes. The previous version
+    built a temporary compositor scene and failed in some Blender 4.4+ contexts with:
+    'Scene' object has no attribute 'node_tree'. Pixel processing is simpler here:
+
+        WeaponTop    = WeaponVisible
+        WeaponBottom = WeaponFull color with alpha = FullAlpha - VisibleAlpha
+    """
     if not os.path.exists(weapon_full_path):
         raise FileNotFoundError(f"Missing WeaponFull render: {weapon_full_path}")
 
     if not os.path.exists(weapon_visible_path):
         raise FileNotFoundError(f"Missing WeaponVisible render: {weapon_visible_path}")
 
-    slot_prefixes = []
-    if weapon_bottom_path:
-        slot_prefixes.append("WeaponBottom_")
-    if weapon_top_path:
-        slot_prefixes.append("WeaponTop_")
-
-    if not slot_prefixes:
+    if not weapon_bottom_path and not weapon_top_path:
         return
 
-    temp_scene = None
-    temp_camera = None
-    temp_camera_data = None
+    # WeaponTop is the depth-tested visible weapon render, optionally expanded
+    # by a few pixels to create a tiny overlap under the Body layer. This helps
+    # hide subpixel/depth-cut seams in layered first-person sprites.
+    if weapon_top_path:
+        save_expanded_weapon_top(
+            weapon_full_path,
+            weapon_visible_path,
+            weapon_top_path,
+            weapon_top_expand_pixels
+        )
+
+    # WeaponBottom is only needed when requested.
+    if not weapon_bottom_path:
+        return
+
     weapon_full_image = None
     weapon_visible_image = None
 
-    with tempfile.TemporaryDirectory(prefix="fp_layer_compositor_") as compositor_dir:
-        try:
-            temp_scene = bpy.data.scenes.new("FP_Layer_Compositor_Temp")
-            temp_scene.render.engine = source_scene.render.engine
-            temp_scene.render.resolution_x = source_scene.render.resolution_x
-            temp_scene.render.resolution_y = source_scene.render.resolution_y
-            temp_scene.render.resolution_percentage = source_scene.render.resolution_percentage
-            temp_scene.render.film_transparent = True
-            temp_scene.render.image_settings.file_format = "PNG"
-            temp_scene.render.image_settings.color_mode = "RGBA"
-            temp_scene.render.use_file_extension = True
-            temp_scene.render.use_compositing = True
+    try:
+        weapon_full_image = bpy.data.images.load(weapon_full_path, check_existing=False)
+        weapon_visible_image = bpy.data.images.load(weapon_visible_path, check_existing=False)
 
-            temp_camera_data = bpy.data.cameras.new("FP_Layer_Compositor_Temp_Camera")
-            temp_camera = bpy.data.objects.new("FP_Layer_Compositor_Temp_Camera", temp_camera_data)
-            temp_scene.collection.objects.link(temp_camera)
-            temp_scene.camera = temp_camera
+        full_width, full_height = weapon_full_image.size
+        visible_width, visible_height = weapon_visible_image.size
 
-            temp_scene.use_nodes = True
-            tree = temp_scene.node_tree
-            nodes = tree.nodes
-            links = tree.links
-            nodes.clear()
+        if full_width != visible_width or full_height != visible_height:
+            raise RuntimeError(
+                "WeaponFull and WeaponVisible renders have different dimensions."
+            )
 
-            weapon_full_image = bpy.data.images.load(weapon_full_path, check_existing=False)
-            weapon_visible_image = bpy.data.images.load(weapon_visible_path, check_existing=False)
+        full_pixels = [0.0] * (full_width * full_height * 4)
+        visible_pixels = [0.0] * (visible_width * visible_height * 4)
+        bottom_pixels = [0.0] * (full_width * full_height * 4)
 
-            weapon_full_node = nodes.new("CompositorNodeImage")
-            weapon_full_node.image = weapon_full_image
+        weapon_full_image.pixels.foreach_get(full_pixels)
+        weapon_visible_image.pixels.foreach_get(visible_pixels)
 
-            weapon_visible_node = nodes.new("CompositorNodeImage")
-            weapon_visible_node.image = weapon_visible_image
+        pixel_count = full_width * full_height
 
-            full_color = safe_node_output(weapon_full_node, "Image", 0)
-            full_alpha = safe_node_output(weapon_full_node, "Alpha", 1)
-            visible_color = safe_node_output(weapon_visible_node, "Image", 0)
-            visible_alpha = safe_node_output(weapon_visible_node, "Alpha", 1)
+        for pixel_index in range(pixel_count):
+            base = pixel_index * 4
 
-            file_node = add_file_output_node(nodes, compositor_dir, slot_prefixes)
-            output_index = 0
+            full_alpha = full_pixels[base + 3]
+            visible_alpha = visible_pixels[base + 3]
+            bottom_alpha = max(0.0, min(1.0, full_alpha - visible_alpha))
 
-            if weapon_bottom_path:
-                bottom_alpha = nodes.new("CompositorNodeMath")
-                bottom_alpha.operation = "SUBTRACT"
-                bottom_alpha.use_clamp = True
-                links.new(full_alpha, bottom_alpha.inputs[0])
-                links.new(visible_alpha, bottom_alpha.inputs[1])
+            bottom_pixels[base + 0] = full_pixels[base + 0]
+            bottom_pixels[base + 1] = full_pixels[base + 1]
+            bottom_pixels[base + 2] = full_pixels[base + 2]
+            bottom_pixels[base + 3] = bottom_alpha
 
-                bottom_set_alpha = nodes.new("CompositorNodeSetAlpha")
-                links.new(full_color, safe_node_input(bottom_set_alpha, "Image", 0))
-                links.new(bottom_alpha.outputs[0], safe_node_input(bottom_set_alpha, "Alpha", 1))
-                links.new(safe_node_output(bottom_set_alpha, "Image", 0), file_node.inputs[output_index])
-                output_index += 1
+        save_pixels_to_png(full_width, full_height, bottom_pixels, weapon_bottom_path)
 
-            if weapon_top_path:
-                top_set_alpha = nodes.new("CompositorNodeSetAlpha")
-                links.new(visible_color, safe_node_input(top_set_alpha, "Image", 0))
-                links.new(visible_alpha, safe_node_input(top_set_alpha, "Alpha", 1))
-                links.new(safe_node_output(top_set_alpha, "Image", 0), file_node.inputs[output_index])
-
-            bpy.ops.render.render(write_still=False, scene=temp_scene.name)
-
-            move_compositor_output(compositor_dir, "WeaponBottom_", weapon_bottom_path)
-            move_compositor_output(compositor_dir, "WeaponTop_", weapon_top_path)
-
-        finally:
-            if weapon_full_image:
-                bpy.data.images.remove(weapon_full_image)
-            if weapon_visible_image:
-                bpy.data.images.remove(weapon_visible_image)
-            if temp_scene:
-                bpy.data.scenes.remove(temp_scene)
-            if temp_camera:
-                bpy.data.objects.remove(temp_camera)
-            if temp_camera_data:
-                bpy.data.cameras.remove(temp_camera_data)
-
+    finally:
+        if weapon_full_image:
+            bpy.data.images.remove(weapon_full_image)
+        if weapon_visible_image:
+            bpy.data.images.remove(weapon_visible_image)
 
 # -----------------------------------------------------------------------------
 # Main exporter
@@ -837,8 +1360,10 @@ class FP_OT_export_layers(bpy.types.Operator):
             self.report({"ERROR"}, "Weapon object list is empty.")
             return {"CANCELLED"}
 
-        if (needs_weapon_split or settings.export_body) and not category_objects["BODY"]:
-            self.report({"ERROR"}, "Body object list is empty. Body is required as the visible layer and/or mask.")
+        armor_needs_body_holdout = settings.export_armor and settings.armor_body_holdout
+
+        if (needs_weapon_split or settings.export_body or armor_needs_body_holdout) and not category_objects["BODY"]:
+            self.report({"ERROR"}, "Body object list is empty. Body is required as the visible layer and/or holdout mask.")
             return {"CANCELLED"}
 
         if settings.export_armor and not category_objects["ARMOR"]:
@@ -951,9 +1476,26 @@ class FP_OT_export_layers(bpy.types.Operator):
                             armor_filename
                         )
 
-                        set_visible_render_category(scene, category_objects["ARMOR"])
-                        render_current_scene_to_file(scene, armor_final_path)
-                        total_renders += 1
+                        if settings.armor_body_holdout:
+                            armor_full_path = os.path.join(temp_dir, f"ArmorFull_{frame_number}.png")
+                            armor_visible_path = os.path.join(temp_dir, f"ArmorVisible_{frame_number}.png")
+                            armor_expand_pixels = settings.armor_expand_pixels if settings.expand_armor else 0
+
+                            render_holdout_layer_with_optional_expansion(
+                                scene,
+                                category_objects["ARMOR"],
+                                category_objects["BODY"],
+                                armor_full_path,
+                                armor_visible_path,
+                                armor_final_path,
+                                armor_expand_pixels
+                            )
+                            total_renders += 2
+                            total_generated += 1
+                        else:
+                            set_visible_render_category(scene, category_objects["ARMOR"])
+                            render_current_scene_to_file(scene, armor_final_path)
+                            total_renders += 1
 
                     if needs_weapon_split:
                         weapon_bottom_path = None
@@ -983,7 +1525,8 @@ class FP_OT_export_layers(bpy.types.Operator):
                                 weapon_source_path,
                                 weapon_visible_path,
                                 weapon_bottom_path,
-                                weapon_top_path
+                                weapon_top_path,
+                                settings.weapon_top_expand_pixels if settings.expand_weapon_top else 0
                             )
                         except Exception as err:
                             self.report({"ERROR"}, f"Weapon split failed: {err}")
@@ -992,11 +1535,21 @@ class FP_OT_export_layers(bpy.types.Operator):
                         total_generated += int(bool(weapon_bottom_path)) + int(bool(weapon_top_path))
 
                     if settings.render_normal_maps:
+                        normal_body_final_path = None
+                        normal_armor_final_path = None
+                        normal_weapon_bottom_path = None
+                        normal_weapon_top_path = None
+
+                        data_body_path = None
+                        data_armor_path = None
+                        data_weapon_bottom_path = None
+                        data_weapon_top_path = None
+
                         apply_material_override_to_objects(normal_override_objects, normal_material)
                         context.view_layer.update()
 
-                        scene.view_settings.view_transform = 'Standard'
-                        scene.view_settings.look = 'None'
+                        scene.view_settings.view_transform = "Standard"
+                        scene.view_settings.look = "None"
                         scene.view_settings.exposure = 0.0
                         scene.view_settings.gamma = 1.0
 
@@ -1040,14 +1593,28 @@ class FP_OT_export_layers(bpy.types.Operator):
                                 normal_armor_filename
                             )
 
-                            set_visible_render_category(scene, category_objects["ARMOR"])
-                            render_current_scene_to_file(scene, normal_armor_final_path)
-                            total_renders += 1
+                            if settings.armor_body_holdout:
+                                normal_armor_full_path = os.path.join(temp_dir, f"ArmorFull_N_{frame_number}.png")
+                                normal_armor_visible_path = os.path.join(temp_dir, f"ArmorVisible_N_{frame_number}.png")
+                                armor_expand_pixels = settings.armor_expand_pixels if settings.expand_armor else 0
+
+                                render_holdout_layer_with_optional_expansion(
+                                    scene,
+                                    category_objects["ARMOR"],
+                                    category_objects["BODY"],
+                                    normal_armor_full_path,
+                                    normal_armor_visible_path,
+                                    normal_armor_final_path,
+                                    armor_expand_pixels
+                                )
+                                total_renders += 2
+                                total_generated += 1
+                            else:
+                                set_visible_render_category(scene, category_objects["ARMOR"])
+                                render_current_scene_to_file(scene, normal_armor_final_path)
+                                total_renders += 1
 
                         if needs_weapon_split:
-                            normal_weapon_bottom_path = None
-                            normal_weapon_top_path = None
-
                             if settings.export_weapon_bottom:
                                 normal_weapon_bottom_path = layer_output_file(
                                     base_output_path,
@@ -1072,7 +1639,8 @@ class FP_OT_export_layers(bpy.types.Operator):
                                     normal_weapon_source_path,
                                     normal_weapon_visible_path,
                                     normal_weapon_bottom_path,
-                                    normal_weapon_top_path
+                                    normal_weapon_top_path,
+                                    settings.weapon_top_expand_pixels
                                 )
                             except Exception as err:
                                 self.report({"ERROR"}, f"Normal weapon split failed: {err}")
@@ -1082,6 +1650,90 @@ class FP_OT_export_layers(bpy.types.Operator):
 
                         restore_material_slots_by_object(captured_normal_materials)
                         context.view_layer.update()
+
+                        if settings.pack_specular_emissive_alpha:
+                            apply_sprite_data_materials_to_objects(normal_override_objects)
+                            context.view_layer.update()
+
+                            scene.view_settings.view_transform = "Raw"
+                            scene.view_settings.look = "None"
+                            scene.view_settings.exposure = 0.0
+                            scene.view_settings.gamma = 1.0
+
+                            if needs_weapon_split:
+                                data_weapon_source_path = os.path.join(temp_dir, f"WeaponFull_Data_{frame_number}.png")
+                                data_weapon_visible_path = os.path.join(temp_dir, f"WeaponVisible_Data_{frame_number}.png")
+
+                                set_visible_render_category(scene, category_objects["WEAPON"])
+                                render_current_scene_to_file(scene, data_weapon_source_path)
+                                total_renders += 1
+
+                                render_weapon_visible_depth_pass(
+                                    scene,
+                                    category_objects["WEAPON"],
+                                    category_objects["BODY"],
+                                    data_weapon_visible_path
+                                )
+                                total_renders += 1
+
+                            if settings.export_body and normal_body_final_path:
+                                data_body_path = os.path.join(temp_dir, f"Body_Data_{frame_number}.png")
+                                set_visible_render_category(scene, category_objects["BODY"])
+                                render_current_scene_to_file(scene, data_body_path)
+                                total_renders += 1
+
+                            if settings.export_armor and category_objects["ARMOR"] and normal_armor_final_path:
+                                data_armor_path = os.path.join(temp_dir, f"Armor_Data_{frame_number}.png")
+                                if settings.armor_body_holdout:
+                                    data_armor_full_path = os.path.join(temp_dir, f"ArmorFull_Data_{frame_number}.png")
+                                    data_armor_visible_path = os.path.join(temp_dir, f"ArmorVisible_Data_{frame_number}.png")
+                                    armor_expand_pixels = settings.armor_expand_pixels if settings.expand_armor else 0
+
+                                    render_holdout_layer_with_optional_expansion(
+                                        scene,
+                                        category_objects["ARMOR"],
+                                        category_objects["BODY"],
+                                        data_armor_full_path,
+                                        data_armor_visible_path,
+                                        data_armor_path,
+                                        armor_expand_pixels
+                                    )
+                                    total_renders += 2
+                                    total_generated += 1
+                                else:
+                                    set_visible_render_category(scene, category_objects["ARMOR"])
+                                    render_current_scene_to_file(scene, data_armor_path)
+                                    total_renders += 1
+
+                            if needs_weapon_split:
+                                if normal_weapon_bottom_path:
+                                    data_weapon_bottom_path = os.path.join(temp_dir, f"WeaponBottom_Data_{frame_number}.png")
+
+                                if normal_weapon_top_path:
+                                    data_weapon_top_path = os.path.join(temp_dir, f"WeaponTop_Data_{frame_number}.png")
+
+                                try:
+                                    split_weapon_with_depth_visible_compositor(
+                                        scene,
+                                        data_weapon_source_path,
+                                        data_weapon_visible_path,
+                                        data_weapon_bottom_path,
+                                        data_weapon_top_path,
+                                        settings.weapon_top_expand_pixels
+                                    )
+                                except Exception as err:
+                                    self.report({"ERROR"}, f"Sprite-data weapon split failed: {err}")
+                                    return {"CANCELLED"}
+
+                                total_generated += int(bool(data_weapon_bottom_path)) + int(bool(data_weapon_top_path))
+
+                            combine_normal_alpha_with_sprite_data(normal_body_final_path, data_body_path)
+                            combine_normal_alpha_with_sprite_data(normal_armor_final_path, data_armor_path)
+                            combine_normal_alpha_with_sprite_data(normal_weapon_bottom_path, data_weapon_bottom_path)
+                            combine_normal_alpha_with_sprite_data(normal_weapon_top_path, data_weapon_top_path)
+
+                            restore_material_slots_by_object(captured_normal_materials)
+                            context.view_layer.update()
 
                         scene.view_settings.view_transform = original_view_transform
                         scene.view_settings.look = original_look
@@ -1200,6 +1852,13 @@ class FP_PT_layer_export_panel(bpy.types.Panel):
 
         if settings.render_normal_maps:
             box.prop(settings, "normal_maps_use_smooth_normals")
+            box.prop(settings, "pack_specular_emissive_alpha")
+
+            if settings.pack_specular_emissive_alpha:
+                data_box = box.box()
+                data_box.label(text="Normal Alpha Packing")
+                data_box.label(text="0-127: shininess from roughness")
+                data_box.label(text="128-255: emissive strength")
 
         box.separator()
 
@@ -1221,7 +1880,16 @@ class FP_PT_layer_export_panel(bpy.types.Panel):
         box.prop(settings, "export_weapon_bottom")
         box.prop(settings, "export_body")
         box.prop(settings, "export_armor")
+        if settings.export_armor:
+            box.prop(settings, "armor_body_holdout")
+            if settings.armor_body_holdout:
+                box.prop(settings, "expand_armor")
+                if settings.expand_armor:
+                    box.prop(settings, "armor_expand_pixels")
         box.prop(settings, "export_weapon_top")
+        box.prop(settings, "expand_weapon_top")
+        if settings.expand_weapon_top:
+            box.prop(settings, "weapon_top_expand_pixels")
         box.prop(settings, "keep_temp_sources")
 
         box.separator()
