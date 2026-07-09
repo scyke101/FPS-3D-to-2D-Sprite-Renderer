@@ -1,8 +1,8 @@
 bl_info = {
     "name": "FP Layer Exporter",
     "author": "Vi",
-    "version": (1, 7, 1),
-    "blender": (4, 4, 6),
+    "version": (1, 9, 2),
+    "blender": (5, 1, 2),
     "location": "View3D > Sidebar > FP Export",
     "description": "Exports layered first-person sprite sequences from panel-assigned object categories, dynamically splits weapon top/bottom, and optionally renders armor depth-clipped by the body using holdout masking with seam expansion, with optional matching normal-map exports",
     "category": "Render",
@@ -13,6 +13,8 @@ import os
 import tempfile
 import glob
 import shutil
+
+from bpy.app.handlers import persistent
 
 
 RENDERABLE_OBJECT_TYPES = {
@@ -55,6 +57,18 @@ class FPLayerExportSettings(bpy.types.PropertyGroup):
     animation_name: bpy.props.StringProperty(
         name="Animation Name",
         default="1H_Block"
+    )
+
+    sync_animation_name: bpy.props.BoolProperty(
+        name="Sync Animation Name",
+        default=True,
+        description="Automatically set Animation Name from the active object's current action"
+    )
+
+    sync_end_frame: bpy.props.BoolProperty(
+        name="Sync End Frame",
+        default=True,
+        description="Automatically set End Frame to the last keyframed frame on the active object's current action"
     )
 
     hand_name: bpy.props.StringProperty(
@@ -197,6 +211,124 @@ class FPLayerExportSettings(bpy.types.PropertyGroup):
         min=0,
         max=4
     )
+
+
+# -----------------------------------------------------------------------------
+# Animation name sync handler
+# -----------------------------------------------------------------------------
+
+def iter_fcurves_for_anim_data(anim_data):
+    """
+    Yield fcurves for the action + slot assigned to this animation data,
+    across Blender versions.
+
+    Blender 4.3 and older: action.fcurves directly.
+    Blender 4.4/4.5: action.fcurves still works as a legacy proxy.
+    Blender 5.0+: action.fcurves was removed entirely. F-curves live in the
+    channelbag for the assigned action slot, retrieved via
+    anim_utils.action_get_channelbag_for_slot(action, anim_data.action_slot).
+    """
+    if not anim_data or not anim_data.action:
+        return
+
+    action = anim_data.action
+
+    legacy_fcurves = getattr(action, "fcurves", None)
+    if legacy_fcurves is not None and len(legacy_fcurves) > 0:
+        for fcurve in legacy_fcurves:
+            yield fcurve
+        return
+
+    slot = getattr(anim_data, "action_slot", None)
+    if slot is not None:
+        try:
+            from bpy_extras import anim_utils
+            channelbag = anim_utils.action_get_channelbag_for_slot(action, slot)
+        except Exception:
+            channelbag = None
+
+        if channelbag is not None:
+            for fcurve in channelbag.fcurves:
+                yield fcurve
+            return
+
+    # Last resort: scan every channelbag on every layer/strip of the action.
+    for layer in getattr(action, "layers", []):
+        for strip in getattr(layer, "strips", []):
+            for channelbag in getattr(strip, "channelbags", []):
+                for fcurve in getattr(channelbag, "fcurves", []):
+                    yield fcurve
+
+
+def get_last_keyed_frame(anim_data):
+    """
+    Return the highest keyframed frame on the action/slot assigned to this
+    animation data, or None if it has no keys.
+
+    Scans keyframe points directly instead of trusting action.frame_range,
+    which can be overridden by a manual frame range. If no fcurves are
+    reachable at all, falls back to the computed frame_range as long as it is
+    not a manual override.
+    """
+    if not anim_data or not anim_data.action:
+        return None
+
+    last_frame = None
+
+    for fcurve in iter_fcurves_for_anim_data(anim_data):
+        for key in fcurve.keyframe_points:
+            frame = int(round(key.co.x))
+            if last_frame is None or frame > last_frame:
+                last_frame = frame
+
+    action = anim_data.action
+
+    if last_frame is None and not getattr(action, "use_frame_range", False):
+        try:
+            frame_range = action.frame_range
+            last_frame = int(round(frame_range[1]))
+        except Exception:
+            last_frame = None
+
+    return last_frame
+
+
+@persistent
+def fp_sync_animation_name_handler(scene, depsgraph=None):
+    """
+    Keep Animation Name and End Frame in sync with the active object's
+    current action.
+
+    Runs on depsgraph updates, which includes switching actions in the Action
+    Editor and adding/removing keyframes. The equality guards prevent
+    re-triggering the handler by writing properties when nothing changed.
+    """
+    settings = getattr(scene, "fp_layer_export_settings", None)
+    if settings is None:
+        return
+
+    if not settings.sync_animation_name and not settings.sync_end_frame:
+        return
+
+    view_layer = getattr(bpy.context, "view_layer", None)
+    obj = view_layer.objects.active if view_layer else None
+    if not obj:
+        return
+
+    anim_data = obj.animation_data
+    if not anim_data or not anim_data.action:
+        return
+
+    action = anim_data.action
+
+    if settings.sync_animation_name and settings.animation_name != action.name:
+        settings.animation_name = action.name
+
+    if settings.sync_end_frame:
+        last_frame = get_last_keyed_frame(anim_data)
+
+        if last_frame is not None and settings.end_frame != last_frame:
+            settings.end_frame = last_frame
 
 
 # -----------------------------------------------------------------------------
@@ -839,16 +971,14 @@ def collect_keyed_frames_from_objects(objects):
     frames = set()
 
     for obj in objects:
-        anim_data = obj.animation_data
-        if anim_data and anim_data.action:
-            for fcurve in anim_data.action.fcurves:
-                for key in fcurve.keyframe_points:
-                    frames.add(int(round(key.co.x)))
+        for fcurve in iter_fcurves_for_anim_data(obj.animation_data):
+            for key in fcurve.keyframe_points:
+                frames.add(int(round(key.co.x)))
 
         data = getattr(obj, "data", None)
         shape_keys = getattr(data, "shape_keys", None)
-        if shape_keys and shape_keys.animation_data and shape_keys.animation_data.action:
-            for fcurve in shape_keys.animation_data.action.fcurves:
+        if shape_keys:
+            for fcurve in iter_fcurves_for_anim_data(shape_keys.animation_data):
                 for key in fcurve.keyframe_points:
                     frames.add(int(round(key.co.x)))
 
@@ -1862,7 +1992,9 @@ class FP_PT_layer_export_panel(bpy.types.Panel):
 
         box.separator()
 
-        box.prop(settings, "animation_name")
+        anim_row = box.row(align=True)
+        anim_row.prop(settings, "animation_name")
+        anim_row.prop(settings, "sync_animation_name", text="", icon="LINKED")
         box.prop(settings, "hand_name")
         box.prop(settings, "weapon_name")
         box.prop(settings, "armor_name")
@@ -1900,7 +2032,9 @@ class FP_PT_layer_export_panel(bpy.types.Panel):
             sub = box.box()
             sub.prop(settings, "frame_interval")
             sub.prop(settings, "start_frame")
-            sub.prop(settings, "end_frame")
+            end_row = sub.row(align=True)
+            end_row.prop(settings, "end_frame")
+            end_row.prop(settings, "sync_end_frame", text="", icon="LINKED")
             sub.prop(settings, "frame_padding")
         elif settings.export_mode == "KEYED":
             box.label(text="Scans keys on assigned category objects only.")
@@ -1937,8 +2071,14 @@ def register():
         type=FPLayerExportSettings
     )
 
+    if fp_sync_animation_name_handler not in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.append(fp_sync_animation_name_handler)
+
 
 def unregister():
+    if fp_sync_animation_name_handler in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.remove(fp_sync_animation_name_handler)
+
     del bpy.types.Scene.fp_layer_export_settings
 
     for cls in reversed(classes):
